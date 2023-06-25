@@ -169,12 +169,13 @@ app.post("/users/login", async (req, res, _next) => {
       token: token,
     }).then(() => {
       res.send({
+        error: false,
         token: token,
         admin: admin
       });
     });
   } else {
-    res.status(400).send({ msg: "usuario e/ou senha incorretos" });
+    res.send({ error: true, msg: "Usuario e/ou senha incorretos" });
     return;
   }
 });
@@ -205,23 +206,36 @@ app.get("/products", async (req, res, _next) => {
 app.post("/products", async (req, res, _next) => {
   var data = req.body;
 
-  if (
-    !data.name ||
-    !data.price
-  ) {
-    res.status(400).send({
-      msg: "campos obrigatorios nao preenchidos",
-    });
-    return;
-  }
+  var token = req.headers.token;
 
-  knex("products").insert({
-      name: data.name,
-      description: data.description,
-      price: data.price
-    }).then(async () => {
-      res.send({ msg: "Produto criado com sucesso" });
-    });
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
+
+  if (!authentications[0]) {
+    res.send({ error: true, msg: "token invalido" });
+    return;
+  } else {
+    var user_id = authentications[0].user_id;
+    const user = await knex.select("*").from("users").where({ customer_id: user_id });
+
+    if(user[0].admin) {
+      if ( !data.name || !data.price ) {
+        res.status(400).send({
+          msg: "campos obrigatorios nao preenchidos",
+        });
+        return;
+      }
+    
+      knex("products").insert({
+          name: data.name,
+          description: data.description,
+          price: data.price
+        }).then(async () => {
+          res.send({ msg: "Produto criado com sucesso" });
+        });
+    } else {
+      res.send({ msg: "usuario nao administrador" });
+    }
+  }
 });
 
 
@@ -237,20 +251,34 @@ app.put("/products/:id", async (req, res, _next) => {
   var data = req.body;
   var id = req.params.id;
 
-  if (!data.name || !data.price) {
-    res.status(400).send({ msg: "campos obrigatorios nao preenchidos" });
-    return;
-  }
+  var token = req.headers.token;
 
-  knex("products").where({ id: id }).update({
-    name: data.name,
-    brand: data.brand,
-    price: data.price,
-    validity: data.validity,
-    description: data.description,
-  }).then(() => {
-    res.send({ msg: "produto atualizado" });
-  });
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
+
+  if (!authentications[0]) {
+    res.send({ error: true, msg: "token invalido" });
+    return;
+  } else {
+    var user_id = authentications[0].user_id;
+    const user = await knex.select("*").from("users").where({ customer_id: user_id });
+
+    if(user[0].admin) {
+      if (!data.name || !data.price) {
+        res.status(400).send({ msg: "campos obrigatorios nao preenchidos" });
+        return;
+      }
+    
+      knex("products").where({ id: id }).update({
+        name: data.name,
+        price: data.price,
+        description: data.description,
+      }).then(() => {
+        res.send({ msg: "produto atualizado" });
+      });
+    } else {
+      res.send({ msg: "usuario nao administrador" });
+    }
+  }  
 });
 
 
@@ -269,6 +297,15 @@ app.get("/products/:id", async (req, res, _next) => {
 });
 
 
+
+/**
+ * Rota para adicionar um produto ao carrinho.
+ *
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
 app.post("/carts/add/:id", async (req, res, _next) => {
   var token = req.headers.token;
   var product_id = req.params.id;
@@ -281,27 +318,26 @@ app.post("/carts/add/:id", async (req, res, _next) => {
     return;
   } else {
     var user_id = authentications[0].user_id;
-    console.log(user_id);
     var activeCart = await knex.select("*").from("orders").where({ customer_id: user_id, status: 0 });
     if (!activeCart[0]) {
-      knex("orders").insert({
+      await knex("orders").insert({
         creation_time: now,
         total_price: 0,
         status: 0,
         customer_id: user_id
       }).then(async () => {
         activeCart = await knex.select("*").from("orders").where({ customer_id: user_id, status: 0 });
-        console.log(activeCart);
       });
     }
-
-    console.log(activeCart);
     
     var activeProductCart = await knex.select("*").from("order_product").where({ order_id: activeCart[0].id, product_id: product_id });
 
+    const product = await knex.select("*").from("products").where({ id: product_id });
+
     if (activeProductCart[0]) {
       var newQuantity = Number(activeProductCart[0].quantity) + 1;
-      knex("order_product").where({ order_id: activeCart[0].id, product_id: product_id }).update({ quantity: newQuantity }).then(() => {
+      knex("order_product").where({ order_id: activeCart[0].id, product_id: product_id }).update({ quantity: newQuantity, unity_value: product[0].price }).then( async () => {
+        await calculateCartTotal(activeCart[0].id);
         res.send({ msg: "Produto adicionado ao carrinho!" });
       });
     } else {
@@ -309,26 +345,70 @@ app.post("/carts/add/:id", async (req, res, _next) => {
         order_id: activeCart[0].id,
         product_id: product_id,
         quantity: 1,
-        unity_value: 0
+        unity_value: product[0].price
       }).then(async () => {
+        await calculateCartTotal(activeCart[0].id);
         res.send({ msg: "Produto adicionado ao carrinho!" });
       });
     }
-
   }
-
 });
 
 
-app.get("/carts", async (req, res, _next) => {
+
+/**
+ * Rota para diminuir um produto do carrinho.
+ *
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
+app.post("/carts/decrease/:id", async (req, res, _next) => {
+  var token = req.headers.token;
+  var product_id = req.params.id;
+
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
+
+  if (!authentications[0]) {
+    res.send({ error: true, msg: "token invalido" });
+    return;
+  } else {
+    var user_id = authentications[0].user_id;
+    var activeCart = await knex.select("*").from("orders").where({ customer_id: user_id, status: 0 });
+    
+    var activeProductCart = await knex.select("*").from("order_product").where({ order_id: activeCart[0].id, product_id: product_id });
+
+    const product = await knex.select("*").from("products").where({ id: product_id });
+
+    if (activeProductCart[0].quantity <= 1) {
+      knex("order_product").where({order_id: activeCart[0].id, product_id: product_id }).del().then( async () => {
+        await calculateCartTotal(activeCart[0].id);
+        res.send({ msg: "Produto removido do carrinho!" });
+      });
+    } else {
+      var newQuantity = Number(activeProductCart[0].quantity) - 1;
+      knex("order_product").where({ order_id: activeCart[0].id, product_id: product_id }).update({ quantity: newQuantity, unity_value: product[0].price }).then( async () => {
+        await calculateCartTotal(activeCart[0].id);
+        res.send({ msg: "Produto diminuido do carrinho!" });
+      });
+    }
+  }
+});
+
+
+
+/**
+ * Retorna o carrinho de compras e os produtos associados para um usuário autenticado.
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
+app.get("/cart", async (req, res, _next) => {
   var token = req.headers.token;
 
-  const authentications = await knex
-    .select("user_id")
-    .from("authentications")
-    .where({
-      token: token,
-    });
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
 
   if (!authentications[0]) {
     res.send({
@@ -338,115 +418,48 @@ app.get("/carts", async (req, res, _next) => {
     return;
   } else {
     var user_id = authentications[0].user_id;
-    const carts = await knex.select("*").from("cart").where({
-      user_id: user_id,
-    });
-    res.send({
-      carts: carts,
-    });
-  }
-});
+    var activeCart = await knex.select("*").from("orders").where({ customer_id: user_id, status: 0 });
+    if (activeCart[0]) {
+      var products: any = [];
+      await knex.select("*").from("order_product").where({ order_id: activeCart[0].id }).then(async (activeProducts) => {
+        var index = 0;
+        await activeProducts.forEach(async (current) => {
+          await knex.select("*").from("products").where({ id: current.product_id }).then((productDetails) => {
+            current.details = productDetails[0];
+            products.push(current);
+            if (index === activeProducts.length - 1) {
+              products.sort(function compare(a, b) {
+                if (a.product_id < b.product_id) return -1;
+                if (a.product_id > b.product_id) return 1;
+                return 0;
+              })
+              activeCart[0].products = products
 
-app.post("/carts", async (req, res, _next) => {
-  var token = req.headers.token;
-
-  const authentications = await knex
-    .select("user_id")
-    .from("authentications")
-    .where({
-      token: token,
-    });
-
-  if (!authentications[0]) {
-    res.send({
-      error: true,
-      msg: "token invalido",
-    });
-    return;
-  } else {
-    var user_id = authentications[0].user_id;
-    knex("cart")
-      .insert({
-        total_price: 0,
-        status: "P",
-        user_id: user_id,
-      })
-      .then(async () => {
-        res.send({
-          msg: "Carrinho criado com sucesso",
+              res.send(activeCart[0])
+            }
+            index++;
+          });
         });
       });
-  }
-});
-
-app.put("/carts/:id", async (req, res, _next) => {
-  var token = req.headers.token;
-  var cart_id = req.params.id;
-  var data = req.body;
-
-  if (!data.status) {
-    res.send({
-      error: true,
-      msg: "campos obrigatorios nao preenchidos",
-    });
-    return;
-  }
-
-  const authentications = await knex
-    .select("user_id")
-    .from("authentications")
-    .where({
-      token: token,
-    });
-
-  if (!authentications[0]) {
-    res.send({
-      error: true,
-      msg: "token invalido",
-    });
-    return;
-  } else {
-    var user_id = authentications[0].user_id;
-    var found = false;
-    const carts = await knex.select("*").from("cart").where({
-      user_id: user_id,
-    });
-    carts.forEach((cart) => {
-      if (cart.id == cart_id) {
-        found = true;
-        knex("cart")
-          .where({
-            id: cart_id,
-          })
-          .update({
-            status: data.status,
-          })
-          .then(() => {
-            res.send({
-              msg: "carrinho atualizado",
-            });
-          });
-      }
-    });
-    if (!found) {
-      res.send({
-        error: true,
-        msg: "carrinho nao encontrado",
-      });
+    } else {
+      res.send({ error: true })
     }
   }
 });
 
-app.get("/cart-products/:id", async (req, res, _next) => {
-  var token = req.headers.token;
-  var cart_id = req.params.id;
 
-  const authentications = await knex
-    .select("user_id")
-    .from("authentications")
-    .where({
-      token: token,
-    });
+
+/**
+ * Retorna o carrinho de compras e os produtos associados para um usuário autenticado.
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
+app.post("/order/submit", async (req, res, _next) => {
+  var token = req.headers.token;
+
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
 
   if (!authentications[0]) {
     res.send({
@@ -456,203 +469,161 @@ app.get("/cart-products/:id", async (req, res, _next) => {
     return;
   } else {
     var user_id = authentications[0].user_id;
-    var found = false;
-    const carts = await knex.select("*").from("cart").where({
-      user_id: user_id,
+    var activeCart = await knex.select("*").from("orders").where({ customer_id: user_id, status: 0 });
+    if (activeCart[0]) {
+      await knex("orders").where({ id: activeCart[0].id }).update({ status: 1 }).then(() => {
+        res.send({
+          error: false,
+          msg: "pedido realizado com sucesso!",
+        });
+      });
+    } else {
+      res.send({ error: true })
+    }
+  }
+});
+
+
+
+/**
+ * Calcula o total do carrinho de compras com base no ID do pedido.
+ *
+ * @param {number} order_id - O ID do pedido para o qual o total do carrinho será calculado.
+ * @returns {Promise<void>} - Uma promessa vazia.
+ */
+async function calculateCartTotal(order_id) {
+  var priceTotal = 0;
+
+  var activeProducts = await knex.select("*").from("order_product").where({ order_id: order_id });
+
+  activeProducts.forEach(activeProduct => {
+    priceTotal += activeProduct.quantity * activeProduct.unity_value;
+  });
+
+  var now = moment().format('YYYY-MM-DD HH:mm:ss');
+
+  await knex("orders").where({ id: order_id }).update({ total_price: priceTotal, update_time: now });
+
+  return;
+}
+
+
+
+/**
+ * Retorna todos os pedidos do usuário autenticado.
+ *
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
+app.get("/orders", async (req, res, _next) => {
+  var token = req.headers.token;
+
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
+
+  if (!authentications[0]) {
+    res.send({
+      error: true,
+      msg: "token invalido",
     });
-    carts.forEach((cart) => {
-      if (cart.id == cart_id) {
-        found = true;
-        knex
-          .select("*")
-          .from("cart-products")
-          .where({ cart_id: cart_id })
-          .then((response) => {
-            var products: any = [];
-            Promise.all(
-              response.map(async (item) => {
-                await knex
-                  .select("*")
-                  .from("products")
-                  .where({ id: item.product_id })
-                  .then((details) => {
-                    products.push({
-                      item,
-                      details: details[0],
-                    });
-                  });
+    return;
+  } else {
+    var user_id = authentications[0].user_id;
+    const orders = await knex.select("*").from("orders").where({ customer_id: user_id, status: 1 }).orderBy('id', 'desc');
+    res.send({ orders: orders });
+  }
+});
+
+
+
+/**
+ * Retorna um pedido em específico para o usuário autenticado
+ *
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
+app.get("/order/:id", async (req, res, _next) => {
+  var order_id = req.params.id;
+
+  var token = req.headers.token;
+
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
+
+  if (!authentications[0]) {
+    res.send({ error: true, msg: "token invalido" });
+    return;
+  } else {
+    var user_id = authentications[0].user_id;
+    var order = await knex.select("*").from("orders").where({ customer_id: user_id, id: order_id });
+    if (order[0]) {
+      var products: any = [];
+      await knex.select("*").from("order_product").where({ order_id: order[0].id }).then(async (activeProducts) => {
+        var index = 0;
+        await activeProducts.forEach(async (current) => {
+          await knex.select("*").from("products").where({ id: current.product_id }).then((productDetails) => {
+            current.details = productDetails[0];
+            products.push(current);
+            if (index === activeProducts.length - 1) {
+              products.sort(function compare(a, b) {
+                if (a.product_id < b.product_id) return -1;
+                if (a.product_id > b.product_id) return 1;
+                return 0;
               })
-            ).then(() => {
-              res.send({
-                products: products,
-              });
-            });
-          });
-      }
-    });
-    if (!found) {
-      res.send({
-        error: true,
-        msg: "carrinho nao encontrado",
-      });
-    }
-  }
-});
+              order[0].products = products
 
-app.post("/cart-products/:id", async (req, res, _next) => {
-  var token = req.headers.token;
-  var cart_id = req.params.id;
-  var data = req.body;
-
-  if (!data.product_id || !data.quantity) {
-    res.send({
-      error: true,
-      msg: "campos obrigatorios nao preenchidos",
-    });
-    return;
-  }
-
-  const authentications = await knex
-    .select("user_id")
-    .from("authentications")
-    .where({
-      token: token,
-    });
-
-  if (!authentications[0]) {
-    res.send({
-      error: true,
-      msg: "token invalido",
-    });
-    return;
-  } else {
-    var user_id = authentications[0].user_id;
-    var found = false;
-    const carts = await knex.select("*").from("cart").where({
-      user_id: user_id,
-    });
-    carts.forEach((cart) => {
-      if (cart.id == cart_id) {
-        found = true;
-
-        knex
-          .select("*")
-          .from("products")
-          .where({
-            id: data.product_id,
-          })
-          .then(async (product) => {
-            var total_price = product[0].price * data.quantity;
-            var cartProduct = await knex
-              .select("*")
-              .from("cart-products")
-              .where({
-                cart_id: cart_id,
-                product_id: data.product_id,
-              });
-            if (cartProduct[0]) {
-              knex("cart-products")
-                .where({
-                  cart_id: cart_id,
-                  product_id: data.product_id,
-                })
-                .update({
-                  quantity: data.quantity,
-                  unity_price: product[0].price,
-                  total_price: total_price,
-                })
-                .then(() => {
-                  res.send({
-                    msg: "produto atualizado no carrinho",
-                  });
-                });
-            } else {
-              knex("cart-products")
-                .insert({
-                  cart_id: cart_id,
-                  product_id: data.product_id,
-                  quantity: data.quantity,
-                  unity_price: product[0].price,
-                  total_price: total_price,
-                })
-                .then(() => {
-                  res.send({
-                    msg: "produto adicionado ao carrinho",
-                  });
-                });
+              res.send(order[0])
             }
+            index++;
           });
-      }
-    });
-    if (!found) {
-      res.send({
-        error: true,
-        msg: "carrinho nao encontrado",
+        });
       });
+    } else {
+      res.send({ error: true })
     }
   }
 });
 
-app.delete("/cart-products/:id", async (req, res, _next) => {
+
+
+/**
+ * Obtém as informações do cliente autenticado.
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @param {Function} _next - Função de middleware do Express
+ * @returns {JSON}
+ */
+app.get("/customer", async (req, res, _next) => {
   var token = req.headers.token;
-  var cart_id = req.params.id;
-  var data = req.body;
 
-  if (!data.product_id) {
-    res.send({
-      error: true,
-      msg: "campos obrigatorios nao preenchidos",
-    });
-    return;
-  }
-
-  const authentications = await knex
-    .select("user_id")
-    .from("authentications")
-    .where({
-      token: token,
-    });
+  const authentications = await knex.select("user_id").from("authentications").where({ token: token });
 
   if (!authentications[0]) {
-    res.send({
-      error: true,
-      msg: "token invalido",
-    });
+    res.send({ error: true, msg: "token invalido" });
     return;
   } else {
     var user_id = authentications[0].user_id;
-    var found = false;
-    const carts = await knex.select("*").from("cart").where({
-      user_id: user_id,
+    await knex.select("*").from("customers").where({ id: user_id }).then((customer) => {
+      res.send(customer[0]);
     });
-    carts.forEach((cart) => {
-      if (cart.id == cart_id) {
-        found = true;
-        knex("cart-products")
-          .where({
-            cart_id: cart_id,
-            product_id: data.product_id,
-          })
-          .del()
-          .then(() => {
-            res.send({
-              msg: "produto removido do carrinho com sucesso",
-            });
-          });
-      }
-    });
-    if (!found) {
-      res.send({
-        error: true,
-        msg: "carrinho nao encontrado",
-      });
-    }
   }
 });
 
+
+
+/**
+ * Caso uma rota não exista
+ * @param {Object} req - Objeto de requisição do Express.
+ * @param {Object} res - Objeto de resposta do Express.
+ * @returns {JSON}
+ */
 app.use((_req, res) => {
   res.status(404);
 });
+
+
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando com sucesso ${HOSTNAME}:${PORT}`);
